@@ -67,8 +67,17 @@ async def init_db():
                 value TEXT NOT NULL
             )
         """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS cooldowns (
+                user_id INTEGER PRIMARY KEY,
+                cooldown_until_game INTEGER NOT NULL
+            )
+        """)
         await db.execute(
             "INSERT OR IGNORE INTO settings(key, value) VALUES('paused', '0')"
+        )
+        await db.execute(
+            "INSERT OR IGNORE INTO settings(key, value) VALUES('completed_games', '0')"
         )
         await db.commit()
 
@@ -102,9 +111,16 @@ async def assign_players():
                 if await cur.fetchone():
                     continue
 
-                cur = await db.execute(
-                    "SELECT user_id, name FROM queue ORDER BY joined_at, user_id LIMIT 2"
-                )
+                cur = await db.execute("""
+                    SELECT q.user_id, q.name
+                    FROM queue q
+                    LEFT JOIN cooldowns c ON c.user_id = q.user_id
+                    LEFT JOIN settings s ON s.key = 'completed_games'
+                    WHERE c.user_id IS NULL
+                       OR CAST(s.value AS INTEGER) >= c.cooldown_until_game
+                    ORDER BY q.joined_at, q.user_id
+                    LIMIT 2
+                """)
                 players = await cur.fetchall()
                 if len(players) < 2:
                     break
@@ -274,6 +290,22 @@ async def join(call: CallbackQuery):
             if paused:
                 await call.answer("Запись временно приостановлена.", show_alert=True)
                 return
+            cur = await db.execute("SELECT value FROM settings WHERE key='completed_games'")
+            games_row = await cur.fetchone()
+            completed_games = int(games_row[0]) if games_row else 0
+            cur = await db.execute(
+                "SELECT cooldown_until_game FROM cooldowns WHERE user_id=?", (uid,)
+            )
+            cooldown_row = await cur.fetchone()
+            if cooldown_row:
+                remaining = int(cooldown_row[0]) - completed_games
+                if remaining > 0:
+                    await call.answer(
+                        f"После вашей игры нужно завершить ещё {remaining} матча.",
+                        show_alert=True
+                    )
+                    return
+                await db.execute("DELETE FROM cooldowns WHERE user_id=?", (uid,))
             cur = await db.execute(
                 "SELECT 1 FROM queue WHERE user_id=?", (uid,)
             )
@@ -330,13 +362,32 @@ async def finish(call: CallbackQuery):
                 await call.answer("Завершить эту игру может только участник или администратор.", show_alert=True)
                 return
             await db.execute("DELETE FROM matches WHERE table_no=?", (table_no,))
+            cur = await db.execute(
+                "SELECT value FROM settings WHERE key='completed_games'"
+            )
+            games_row = await cur.fetchone()
+            completed_games = (int(games_row[0]) if games_row else 0) + 1
+            await db.execute(
+                "INSERT INTO settings(key, value) VALUES('completed_games', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (str(completed_games),)
+            )
+            cooldown_until = completed_games + 3
+            for player_id in (match["player1_id"], match["player2_id"]):
+                await db.execute(
+                    "INSERT INTO cooldowns(user_id, cooldown_until_game) VALUES(?, ?) "
+                    "ON CONFLICT(user_id) DO UPDATE SET cooldown_until_game=excluded.cooldown_until_game",
+                    (player_id, cooldown_until)
+                )
             await db.commit()
 
     for player_id in (match["player1_id"], match["player2_id"]):
         try:
             await bot.send_message(
                 player_id,
-                f"Игра за столом №{table_no} завершена. Спасибо! Следующая пара уже может занимать стол."
+                f"Игра за столом №{table_no} завершена. Спасибо!\n\n"
+                f"По правилам очереди вы пропускаете следующие 3 завершённых матча. "
+                f"После них сможете снова записаться."
             )
         except (TelegramForbiddenError, TelegramBadRequest):
             pass
